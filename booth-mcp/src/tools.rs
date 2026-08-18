@@ -149,8 +149,6 @@ struct UpdateCheckResult {
     release_title: Option<String>,
     release_body: Option<String>,
     error: Option<String>,
-    release_title: Option<String>,
-    release_body: Option<String>,
 }
 
 // ── 服务 ─────────────────────────────────────────────────────────
@@ -440,8 +438,6 @@ impl BoothServer {
             release_title: info.release_title,
             release_body: info.release_body,
             error: info.error,
-            release_title: info.release_title,
-            release_body: info.release_body,
         };
         let text = serde_json::to_string_pretty(&result).unwrap_or_default();
         CallToolResult::success(vec![ContentBlock::text(text)])
