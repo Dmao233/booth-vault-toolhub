@@ -169,3 +169,30 @@ cd gui && npm run tauri dev # GUI 开发
 - [ ] 文件夹图标三件套 + Explorer 刷新实机验证通过。
 - [ ] agent 技能切换入口后全流程可用（下载/整理/搜索/巡检）。
 - [ ] 退出码 + JSON 输出可供 MCP 可靠判断成败。
+
+## Cursor Cloud specific instructions
+
+> 本节面向 Cursor 云端 agent（Linux VM）。系统依赖与 Rust/npm 依赖已由启动脚本 + 快照就绪，本节只记非显然的坑与跑法。
+
+### 平台门控：Linux 上必须排除 `shell_win`
+- `shell_win` 无条件依赖 `windows` crate，**在 Linux/macOS 根本无法编译**（`windows-future` 会报 `windows_threading::submit` 缺失）。
+- 因此 `cargo build --workspace` / `clippy --workspace` / `test --workspace` **只在 Windows 可用**。在本 VM 一律加 `--exclude shell_win`：
+  - 构建：`cargo build --workspace --exclude shell_win`（含 `engine`/`booth`、`booth-mcp`、`gui/src-tauri`）
+  - lint：`cargo clippy --workspace --exclude shell_win --all-targets -- -D warnings`
+  - 测试：`cargo test --workspace --exclude shell_win`
+- 这与 CI 一致：CI 的 `windows` job 跑全 workspace，`portable`（Linux/macOS）job 只跑 `-p engine` 且 `continue-on-error`。Windows 是主目标。
+
+### 已知非环境导致的测试失败
+- `engine::audit::tests::scan_library_separators` 在本 VM **会失败**：`scan_library`→`walk_dirs` 直接用 `read_dir` 不排序，该用例却断言按创建顺序返回，依赖文件系统 readdir 顺序（Windows/CI 上恰好通过）。属既有用例脆弱性，非环境问题，勿为此改动引擎代码。其余 107 个 engine 用例通过。
+
+### GUI（Tauri v2）在无头 VM 上的跑法
+- VM 有 X server（`DISPLAY=:1`），可直接 `cd gui && npm run tauri dev`。
+- webkit2gtk 在 VM 里需软件渲染，务必先设环境变量再启动，否则可能白屏/崩溃：
+  `export DISPLAY=:1 WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1`
+- 纯前端（不含 Tauri invoke）也可 `cd gui && npm run dev`（Vite，端口 1420）单跑，但 `invoke` 命令只有在 `tauri dev` 里才生效。
+- GUI 巡检/整理默认根目录取配置 `download_root`；在设置页填根目录后再巡检。Linux 上无 `shell_win`，图标三件套的“修复”会退化为只报告缺失（符合平台门控预期）。
+
+### 快速自检（CLI/MCP 冒烟）
+- CLI：`./target/debug/booth --json audit --base <某库目录> --dry-run`，退出码 `1`=有缺失项（契约：0 成功/1 有失败/2 致命）。
+- MCP：`booth-mcp` 是 stdio JSON-RPC；喂 `initialize`→`notifications/initialized`→`tools/list` 应返回 `download/organize/search/audit` 四工具。
+- `download`/`organize`/`search` 真正拉取需访问 BOOTH 且多数要登录 Cookie，本地冒烟优先用 `audit`（纯本地）。
