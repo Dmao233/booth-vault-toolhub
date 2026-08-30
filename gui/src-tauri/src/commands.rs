@@ -656,6 +656,7 @@ fn pick_search_match(
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_default();
     let queries = engine::clean::sanitize_query(&fname);
+    let names = engine::unitypackage::names_for_score(path);
     let mut last: Vec<SearchCandidate> = Vec::new();
     for q in queries {
         let results =
@@ -676,7 +677,6 @@ fn pick_search_match(
                 price: it.price,
             })
             .collect();
-        let names = engine::unitypackage::names_for_score(path);
         let (picked, ambiguous) = engine::score::score_and_pick(
             &q,
             &items,
@@ -822,6 +822,9 @@ pub fn version_audit(
     }
     let cookie = resolve_cookie(None, &config);
     let client = make_session(&config, cookie.as_deref());
+    let rate_limit = config
+        .rate_limit_secs
+        .unwrap_or_else(default_rate_limit_secs);
 
     Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let total = engine::audit::scan_library(&base_path).len();
@@ -831,6 +834,7 @@ pub fn version_audit(
         let mut cancelled_now = false;
         let _ = engine::audit::version_audit_with_progress(
             &base_path,
+            rate_limit,
             |id| engine::fetch::fetch_item(&client, id).map_err(|e| e.to_string()),
             |evt| {
                 if cancelled(&flag) {
@@ -1059,18 +1063,26 @@ pub fn backfill_free(
         return Err(engine::download::cookie_required_msg().to_string());
     }
     let client = make_session(&config, cookie.as_deref());
+    let rate_limit = config
+        .rate_limit_secs
+        .unwrap_or_else(default_rate_limit_secs);
     let total = folders.len();
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
         let mut done = 0usize;
         let mut failed = 0usize;
         let mut cancelled_now = false;
+        let mut first = true;
         for folder in folders {
             if cancelled(&flag) {
                 cancelled_now = true;
                 break;
             }
+            if !first {
+                engine::download::sleep_rate_limit(rate_limit);
+            }
+            first = false;
             let path = std::path::PathBuf::from(&folder);
             let stem = path
                 .file_name()

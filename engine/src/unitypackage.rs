@@ -8,11 +8,24 @@ use std::path::Path;
 use flate2::read::GzDecoder;
 use tar::Archive;
 
+const MAX_EXTRACT_BYTES: u64 = 200 * 1024 * 1024;
+
+fn exceeds_extract_limit(len: u64) -> bool {
+    len > MAX_EXTRACT_BYTES
+}
+
 /// zip → gzip → tar → `pathname` 文件内容。
 ///
 /// 输入可以是外层 zip（内含 `.unitypackage`）、裸 `.unitypackage`（gzip+tar），
 /// 或已解压的 tar。任一层失败则跳过该层，全部失败返回空。
+/// 整包超过 200MB 跳过验真，避免大包卡住 GUI。
 pub fn extract_unitypackage_names(path: &Path) -> Vec<String> {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Vec::new();
+    };
+    if meta.len() == 0 || exceeds_extract_limit(meta.len()) {
+        return Vec::new();
+    }
     let bytes = match std::fs::read(path) {
         Ok(b) if !b.is_empty() => b,
         _ => return Vec::new(),
@@ -58,24 +71,26 @@ fn from_zip(bytes: &[u8]) -> Vec<String> {
             continue;
         }
         let name = f.name().to_string();
+        let is_pathname = name
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .eq_ignore_ascii_case("pathname");
+        let is_upk = name.to_ascii_lowercase().ends_with(".unitypackage");
+        if !is_pathname && !is_upk {
+            continue;
+        }
         let mut buf = Vec::new();
         if f.read_to_end(&mut buf).is_err() {
             continue;
         }
-        if name
-            .rsplit('/')
-            .next()
-            .unwrap_or("")
-            .eq_ignore_ascii_case("pathname")
-        {
+        if is_pathname {
             push_pathname(&mut out, &buf);
             continue;
         }
-        if name.to_ascii_lowercase().ends_with(".unitypackage") {
-            out.extend(from_gzip_tar(&buf));
-            if out.is_empty() {
-                out.extend(from_tar(&buf));
-            }
+        out.extend(from_gzip_tar(&buf));
+        if out.is_empty() {
+            out.extend(from_tar(&buf));
         }
     }
     out
@@ -223,5 +238,28 @@ mod tests {
         assert_eq!(names, vec!["Assets/LunariaPaperFan.fbx".to_string()]);
         assert!(names_for_score(&p).is_some());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn zip_skips_unrelated_entries() {
+        let mut zip_buf = Cursor::new(Vec::new());
+        {
+            let mut w = zip::ZipWriter::new(&mut zip_buf);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            w.start_file("noise.bin", opts).unwrap();
+            w.write_all(&[0u8; 4096]).unwrap();
+            w.start_file("guid/pathname", opts).unwrap();
+            w.write_all(b"Assets/OnlyPathname.prefab").unwrap();
+            w.finish().unwrap();
+        }
+        let names = extract_from_bytes(&zip_buf.into_inner());
+        assert_eq!(names, vec!["Assets/OnlyPathname.prefab".to_string()]);
+    }
+
+    #[test]
+    fn extract_limit_is_200mb() {
+        assert!(!exceeds_extract_limit(200 * 1024 * 1024));
+        assert!(exceeds_extract_limit(200 * 1024 * 1024 + 1));
     }
 }

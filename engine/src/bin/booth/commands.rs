@@ -5,6 +5,7 @@
 //!   1 = 有失败项（部分失败）
 //!   2 = 致命错误（参数/配置/网络不可用）
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::{Cli, Command, ShellCmd};
@@ -410,6 +411,7 @@ fn process_search_file(
     } else {
         // 搜索候选 → 评分选优。
         let candidates = engine::clean::sanitize_query(&fname);
+        let names = engine::unitypackage::names_for_score(path);
         let mut best: Option<engine::score::Item> = None;
         for q in candidates {
             let results =
@@ -422,7 +424,6 @@ fn process_search_file(
                     price: r.price,
                 })
                 .collect();
-            let names = engine::unitypackage::names_for_score(path);
             let (picked, _) = engine::score::score_and_pick(
                 &q,
                 &items,
@@ -635,8 +636,20 @@ fn cmd_version_audit(
     }
     let cookie = resolve_cookie(cookie, config);
     let client = make_session(config, cookie.as_deref());
-    let rows =
-        engine::audit::version_audit(&base, |id| engine::fetch::fetch_item(&client, id).ok());
+    let rate_limit = config
+        .rate_limit_secs
+        .unwrap_or_else(default_rate_limit_secs);
+    let mut fetched = HashMap::new();
+    let rows = engine::audit::version_audit_with_progress(
+        &base,
+        rate_limit,
+        |id| {
+            let item = engine::fetch::fetch_item(&client, id).map_err(|e| e.to_string())?;
+            fetched.insert(id.to_string(), item.clone());
+            Ok(item)
+        },
+        |_| true,
+    );
     let mut fixed = 0usize;
     let mut failures: Vec<String> = Vec::new();
     if fix {
@@ -645,17 +658,14 @@ fn cmd_version_audit(
             failures.push(engine::download::cookie_required_msg().to_string());
         } else {
             for r in &rows {
-                let item = match engine::fetch::fetch_item(&client, &r.id) {
-                    Ok(i) => i,
-                    Err(e) => {
-                        failures.push(format!("{}: {e}", r.id));
-                        continue;
-                    }
+                let Some(item) = fetched.get(&r.id) else {
+                    failures.push(format!("{}: 巡检结果缺失商品数据", r.id));
+                    continue;
                 };
                 let (n, errs) = engine::organize::backfill_free_files(
                     &client,
                     &r.path,
-                    &item,
+                    item,
                     cookie.as_deref(),
                 );
                 if n > 0 {
@@ -717,11 +727,7 @@ fn cmd_version_audit(
             println!("   ! {f}");
         }
     }
-    if !failures.is_empty() || (!fix && !rows.is_empty()) {
-        1
-    } else {
-        0
-    }
+    if failures.is_empty() { 0 } else { 1 }
 }
 
 /// library：列出库存。

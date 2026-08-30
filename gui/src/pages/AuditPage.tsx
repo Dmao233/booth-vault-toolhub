@@ -247,7 +247,7 @@ export function AuditPage() {
       {showVer && (
         <Section>
           <PanelLabel>版本巡检</PanelLabel>
-          <Muted>比对远程免费文件名与本地文件名版本。付费缺口只开商品页，不自动下。</Muted>
+          <Muted>比对远程免费文件名与本地文件名版本。付费无免费文件不进入结果，不自动下。</Muted>
           <Row>
             <AccentButton
               onClick={() => void launch('version_audit', 'version_audit', { base: boothRoot })}

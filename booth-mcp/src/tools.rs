@@ -458,7 +458,7 @@ impl BoothServer {
 
     /// 版本巡检：按免费文件名比对，可选补免费文件。
     #[tool(
-        description = "巡检归档库免费文件版本：本地文件名 vs 远程免费文件名。fix=true 时补缺失免费文件（需 cookie）。付费缺口只给商品页，不自动下。"
+        description = "巡检归档库免费文件版本：本地文件名 vs 远程免费文件名。fix=true 时补缺失免费文件（需 cookie）。付费无免费文件不进入结果，不自动下。"
     )]
     async fn version_audit(
         &self,
@@ -475,8 +475,20 @@ impl BoothServer {
             return tool_error(&format!("FATAL: {} 不存在", base.display()));
         }
         let client = make_session(&config, params.cookie.as_deref());
-        let rows =
-            engine::audit::version_audit(&base, |id| engine::fetch::fetch_item(&client, id).ok());
+        let rate_limit = config
+            .rate_limit_secs
+            .unwrap_or_else(default_rate_limit_secs);
+        let mut fetched = std::collections::HashMap::new();
+        let rows = engine::audit::version_audit_with_progress(
+            &base,
+            rate_limit,
+            |id| {
+                let item = engine::fetch::fetch_item(&client, id).map_err(|e| e.to_string())?;
+                fetched.insert(id.to_string(), item.clone());
+                Ok(item)
+            },
+            |_| true,
+        );
         let mut fixed = 0usize;
         let mut failures: Vec<String> = Vec::new();
         if params.fix {
@@ -488,17 +500,14 @@ impl BoothServer {
                 failures.push(engine::download::cookie_required_msg().to_string());
             } else {
                 for r in &rows {
-                    let item = match engine::fetch::fetch_item(&client, &r.id) {
-                        Ok(i) => i,
-                        Err(e) => {
-                            failures.push(format!("{}: {e}", r.id));
-                            continue;
-                        }
+                    let Some(item) = fetched.get(&r.id) else {
+                        failures.push(format!("{}: 巡检结果缺失商品数据", r.id));
+                        continue;
                     };
                     let (n, errs) = engine::organize::backfill_free_files(
                         &client,
                         &r.path,
-                        &item,
+                        item,
                         params.cookie.as_deref(),
                     );
                     fixed += n;
@@ -641,6 +650,7 @@ fn process_search_file(
         engine::fetch::fetch_item(client, id).map_err(|e| format!("指定 ID {id} 获取失败: {e}"))?
     } else {
         let candidates = engine::clean::sanitize_query(&fname);
+        let names = engine::unitypackage::names_for_score(path);
         let mut best: Option<engine::score::Item> = None;
         for q in candidates {
             let results =
@@ -653,7 +663,6 @@ fn process_search_file(
                     price: r.price,
                 })
                 .collect();
-            let names = engine::unitypackage::names_for_score(path);
             let (picked, _) = engine::score::score_and_pick(
                 &q,
                 &items,

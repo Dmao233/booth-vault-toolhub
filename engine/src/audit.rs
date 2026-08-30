@@ -448,6 +448,7 @@ pub fn version_audit(
 ) -> Vec<VersionInfo> {
     version_audit_with_progress(
         root,
+        0.0,
         |id| match fetch(id) {
             Some(i) => Ok(i),
             None => Err("未获取到官方信息".to_string()),
@@ -475,13 +476,24 @@ pub enum VersionEvent<'a> {
 /// 收敛 GUI 在进程外复刻的判定核心：`fetch` 负责联网取官方信息，`progress` 负责
 /// 消费每件进度（日志/插桩）。回调返回 `true` 继续、`false` 提前终止（协作式取消）。
 /// 判定逻辑（文件名版本 + `missing_free_files`）单点落此，GUI 不再重复实现。
-pub fn version_audit_with_progress<F, P>(root: &Path, fetch: F, mut progress: P) -> Vec<VersionInfo>
+/// `rate_limit` 按配置在每件 `fetch` 之间 sleep（首件不睡）；单测传 `0.0`。
+pub fn version_audit_with_progress<F, P>(
+    root: &Path,
+    rate_limit: f64,
+    mut fetch: F,
+    mut progress: P,
+) -> Vec<VersionInfo>
 where
-    F: Fn(&str) -> Result<crate::fetch::ItemJson, String>,
+    F: FnMut(&str) -> Result<crate::fetch::ItemJson, String>,
     P: FnMut(VersionEvent<'_>) -> bool,
 {
     let mut out = Vec::new();
+    let mut first = true;
     for d in scan_library(root) {
+        if !first {
+            crate::download::sleep_rate_limit(rate_limit);
+        }
+        first = false;
         let item = match fetch(&d.id) {
             Ok(i) => i,
             Err(e) => {
@@ -1420,6 +1432,7 @@ mod tests {
         let mut compared = Vec::new();
         let out = version_audit_with_progress(
             &base,
+            0.0,
             |id| match id {
                 "1111111" => Ok(json_item_files(
                     "雪女",
@@ -1464,6 +1477,7 @@ mod tests {
         let mut visited = Vec::new();
         let out = version_audit_with_progress(
             &base,
+            0.0,
             |id| match id {
                 "1111111" => Ok(json_item("雪女v2")),
                 "2222222" => Ok(json_item("メカv2")),
