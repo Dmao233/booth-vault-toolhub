@@ -58,26 +58,23 @@ export interface SupportConfig {
   note?: string;
 }
 
-const Wrap = styled.section`
-  flex: none;
-  display: flex;
-  flex-direction: column;
-  gap: var(--bvt-s3);
+const Section = styled.div`
+  margin-top: 4px;
 `;
 
 const Intro = styled.div`
   color: var(--bvt-text2);
-  font-size: var(--bvt-fz-sm);
-  line-height: 1.75;
+  font-size: 12px;
+  line-height: 1.6;
   white-space: pre-wrap;
 `;
 
 /** 作者条目卡片。 */
 const AuthorCard = styled.div`
   display: flex;
-  gap: var(--bvt-s4);
+  gap: 14px;
   align-items: center;
-  padding: var(--bvt-s3) 0;
+  padding: 10px 0;
   border-bottom: 1px solid var(--bvt-border2);
   &:last-of-type { border-bottom: none; }
 `;
@@ -93,10 +90,10 @@ const Qr = styled.img`
 
 const Info = styled.div`
   flex: 1;
-  min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  min-width: 0;
 `;
 
 const Head = styled.div`
@@ -115,18 +112,18 @@ const Avatar = styled.img`
 `;
 
 const Name = styled.div`
-  font-size: var(--bvt-fz-md);
+  font-size: 14px;
   font-weight: 600;
   color: var(--bvt-text);
 `;
 
 const Title = styled.div`
-  font-size: var(--bvt-fz-sm);
+  font-size: 12px;
   color: var(--bvt-text2);
 `;
 
 const Desc = styled.div`
-  font-size: var(--bvt-fz-sm);
+  font-size: 12px;
   color: var(--bvt-text3);
 `;
 
@@ -179,13 +176,14 @@ function faviconSrc(url: string): string {
 
 const Fallback = styled.div`
   color: var(--bvt-text3);
-  font-size: var(--bvt-fz-sm);
+  font-size: 12px;
 `;
 
 const Note = styled.div`
   color: var(--bvt-text3);
-  font-size: var(--bvt-fz-xs);
-  line-height: 1.6;
+  font-size: 11px;
+  line-height: 1.5;
+  margin-top: 8px;
   white-space: pre-wrap;
 `;
 
@@ -193,9 +191,14 @@ const DEFAULT_INTRO = '本工具使用Apache-2.0协议免费开源。\n如果你
 const DEFAULT_NOTE = '赞助将会用于支付作者们给吃软饭的大肥鱼购用token，以及日后可能计划的被库克打劫所获的macos开发者签名\n本工具不会进行强制化收费，不存在VIP档次等级等，自愿赞助，各位老爷赏点白饭吃吧pwp';
 
 const GraphSection = styled.div`
-  display: flex;
-  flex-direction: column;
-  gap: var(--bvt-s3);
+  margin-top: 4px;
+`;
+
+const GraphIntro = styled.div`
+  color: var(--bvt-text2);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
 `;
 
 const CONTRIBUTOR_URL =
@@ -208,13 +211,14 @@ const Graph = styled.img`
   width: auto;
   height: auto;
   object-fit: contain;
+  margin-top: 8px;
 `;
 
 function ContributorGraph() {
   return (
     <GraphSection>
       <PanelLabel>贡献者</PanelLabel>
-      <Intro>感谢所有为这个开源项目贡献过的开发者。</Intro>
+      <GraphIntro>感谢所有为这个开源项目贡献过的开发者。</GraphIntro>
       <Graph src={CONTRIBUTOR_URL} alt="项目贡献者" loading="lazy" />
     </GraphSection>
   );
@@ -259,8 +263,8 @@ export function SupportSection() {
   };
 
   return (
-    <Wrap>
-      <PanelLabel>支持作者</PanelLabel>
+    <Section>
+      <PanelLabel>☕ 支持作者</PanelLabel>
       <Intro>{DEFAULT_INTRO}</Intro>
       {authors.length === 0 ? (
         <Fallback>（构建时未注入支持作者数据，见 SupportSection 注释）</Fallback>
@@ -304,6 +308,6 @@ export function SupportSection() {
       )}
       <Note>{config?.note ?? DEFAULT_NOTE}</Note>
       <ContributorGraph />
-    </Wrap>
+    </Section>
   );
 }

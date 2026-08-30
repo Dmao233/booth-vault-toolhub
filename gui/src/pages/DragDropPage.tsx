@@ -20,7 +20,7 @@ import { cancelTask, retryFailed, runTask } from '../lib/task';
 import { useThemeStore, resolveMode } from '../store/themeStore';
 import { THEMES } from '../theme/themes';
 import { dropTile } from '../theme/motifs';
-import { badgeKind, badgeLabel } from '../lib/booth';
+import { badgeKind, badgeLabel, hasFileProductId } from '../lib/booth';
 
 const DROP_KIND: Record<string, 'zhuyin' | 'liujin' | 'guwen'> = {
   zhuyin: 'zhuyin',
@@ -77,7 +77,7 @@ function ingest(paths: string[]): { good: string[]; bad: string[] } {
   const good: string[] = [];
   const bad: string[] = [];
   for (const p of paths) {
-    if (/(?<!\d)\d{7}(?!\d)/.test(p)) good.push(p);
+    if (hasFileProductId(p)) good.push(p);
     else bad.push(p);
   }
   return { good, bad };

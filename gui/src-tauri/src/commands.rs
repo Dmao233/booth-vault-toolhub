@@ -5,8 +5,9 @@
 //! 取消：managed state 维护 `Arc<AtomicBool>` 取消标志，长任务内协作式检查。
 
 use std::collections::HashMap;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
 use tauri::ipc::Channel;
@@ -21,6 +22,14 @@ use engine::session::make_session;
 /// 全局任务取消状态：`task_id -> cancel_flag`。
 #[derive(Clone, Default)]
 pub struct TaskRegistry(pub Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>);
+
+impl TaskRegistry {
+    pub fn cancel_all(&self) {
+        for flag in registry_lock(&self.0).values() {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
 
 /// 进度事件（前端 Channel 载荷）。
 #[derive(Clone, Debug, Serialize)]
@@ -83,17 +92,18 @@ fn resolve_root(config: &AppConfig, arg: Option<&str>) -> Result<std::path::Path
 fn register_task(registry: &State<'_, TaskRegistry>) -> (String, Arc<AtomicBool>) {
     let task_id = uuid();
     let flag = Arc::new(AtomicBool::new(false));
-    registry
-        .0
-        .lock()
-        .unwrap()
-        .insert(task_id.clone(), flag.clone());
+    registry_lock(&registry.0).insert(task_id.clone(), flag.clone());
     (task_id, flag)
 }
 
-/// 协作式取消：检查标志并睡眠一小段（让出）。
+fn registry_lock(
+    map: &Mutex<HashMap<String, Arc<AtomicBool>>>,
+) -> MutexGuard<'_, HashMap<String, Arc<AtomicBool>>> {
+    map.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 fn cancelled(flag: &AtomicBool) -> bool {
-    flag.load(Ordering::Relaxed)
+    flag.load(Ordering::Acquire)
 }
 
 /// 简单 task id（时间戳 + 随机后缀）。
@@ -109,17 +119,44 @@ fn uuid() -> String {
 /// 取消任务。
 #[tauri::command]
 pub fn cancel_task(registry: State<'_, TaskRegistry>, task_id: String) -> bool {
-    let guard = registry.0.lock().unwrap();
+    let guard = registry_lock(&registry.0);
     if let Some(flag) = guard.get(&task_id) {
-        flag.store(true, Ordering::Relaxed);
+        flag.store(true, Ordering::Release);
         true
     } else {
         false
     }
 }
 
-/// 立刻返回 task_id，工作在后台跑；结束时从注册表摘掉。
-fn spawn_job<F>(registry: &State<'_, TaskRegistry>, job: F) -> String
+struct JobGuard {
+    map: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    tid: String,
+    on_event: Channel<ProgressEvent>,
+    done: bool,
+}
+
+impl Drop for JobGuard {
+    fn drop(&mut self) {
+        registry_lock(&self.map).remove(&self.tid);
+        if !self.done {
+            let _ = self.on_event.send(ProgressEvent::ItemError {
+                id: String::new(),
+                message: "任务异常终止".to_string(),
+            });
+            let _ = self.on_event.send(ProgressEvent::Finished {
+                done: 0,
+                failed: 1,
+                updateable: 0,
+            });
+        }
+    }
+}
+
+fn spawn_job<F>(
+    registry: &State<'_, TaskRegistry>,
+    on_event: Channel<ProgressEvent>,
+    job: F,
+) -> String
 where
     F: FnOnce(Arc<AtomicBool>) + Send + 'static,
 {
@@ -127,10 +164,13 @@ where
     let map = registry.0.clone();
     let tid = task_id.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        job(flag);
-        if let Ok(mut g) = map.lock() {
-            g.remove(&tid);
-        }
+        let mut guard = JobGuard {
+            map,
+            tid,
+            on_event,
+            done: false,
+        };
+        guard.done = catch_unwind(AssertUnwindSafe(|| job(flag))).is_ok();
     });
     task_id
 }
@@ -206,7 +246,7 @@ pub fn download(
         return Err("提供店铺 URL/子域名，或用 items 提供商品链接/ID".to_string());
     }
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let mut ids = ids;
         if let Some(sub) = shop_id {
             if cancelled(&flag) {
@@ -367,7 +407,7 @@ pub fn organize(
     let client = make_session(&config, cookie.as_deref());
     let total = archives.len();
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
         let mut ok = 0usize;
         let mut failed = 0usize;
@@ -442,6 +482,44 @@ pub fn organize(
 }
 
 /// search：按名搜索并整理本地文件。立刻返回 task_id。
+///
+/// 输入允许混入文件夹：此处先递归展开为其中的普通文件，
+/// 使「拖入文件夹 → 逐文件检索」而非仅按文件夹名搜一次。
+fn expand_directories(files: &[String]) -> Vec<String> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.filter_map(Result::ok) {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if ft.is_dir() {
+                walk(&path, out);
+            } else if entry.file_name() != "desktop.ini"
+                && entry.file_name() != "Thumbs.db"
+                && entry.file_name() != ".DS_Store"
+            {
+                out.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for f in files {
+        let p = std::path::Path::new(f);
+        if p.is_dir() {
+            walk(p, &mut out);
+        } else {
+            out.push(f.clone());
+        }
+    }
+    out
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn search(
@@ -458,9 +536,10 @@ pub fn search(
     let base = resolve_root(&config, base_dir.as_deref())?;
     let cookie = resolve_cookie(cookie.as_deref(), &config);
     let client = make_session(&config, cookie.as_deref());
+    let files = expand_directories(&files);
     let total = files.len();
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
         let mut matched = 0usize;
         let mut failed = 0usize;
@@ -670,7 +749,7 @@ pub fn audit(
         return Err(format!("FATAL: {} 不存在", base_path.display()));
     }
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let dirs = engine::audit::scan_library(&base_path);
         let total = dirs.len();
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
@@ -695,12 +774,16 @@ pub fn audit(
                 }
             }
             let _ = on_event.send(ProgressEvent::ItemDone {
-                id: format!("{} · {}", d.id, d.name),
-                message: if d.missing.is_empty() {
-                    "[完整]".to_string()
-                } else {
-                    format!("[缺{}]", d.missing.join("/"))
-                },
+                id: d.id.clone(),
+                message: format!(
+                    "{} · {}",
+                    d.name,
+                    if d.missing.is_empty() {
+                        "[完整]".to_string()
+                    } else {
+                        format!("[缺{}]", d.missing.join("/"))
+                    }
+                ),
                 status: if d.missing.is_empty() {
                     "ok".to_string()
                 } else {
@@ -740,7 +823,7 @@ pub fn version_audit(
     let cookie = resolve_cookie(None, &config);
     let client = make_session(&config, cookie.as_deref());
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let total = engine::audit::scan_library(&base_path).len();
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
         let mut updateable = 0usize;
@@ -778,8 +861,11 @@ pub fn version_audit(
                         if is_updateable {
                             updateable += 1;
                             let _ = on_event.send(ProgressEvent::ItemDone {
-                                id: format!("{} · {}", dir.id, dir.name),
-                                message: format!("本地 {local_s} → 远程 {official_s} 可更新"),
+                                id: dir.id.clone(),
+                                message: format!(
+                                    "{} · 本地 {local_s} → 远程 {official_s} 可更新",
+                                    dir.name
+                                ),
                                 status: "ok".to_string(),
                                 path: Some(dir.path.display().to_string()),
                                 price: None,
@@ -817,7 +903,7 @@ pub fn mismatch_audit(
     let cookie = resolve_cookie(None, &config);
     let client = make_session(&config, cookie.as_deref());
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let total = engine::audit::scan_library(&base_path).len();
         let _ = on_event.send(ProgressEvent::TaskStarted { total });
         let found = engine::audit::mismatch_audit(&base_path, |id| {
@@ -836,8 +922,8 @@ pub fn mismatch_audit(
                 return;
             }
             let _ = on_event.send(ProgressEvent::ItemDone {
-                id: format!("{} · {}", m.id, m.name),
-                message: format!("[{} → 期望 {}]", m.wrong_cat, m.dest_cat),
+                id: m.id.clone(),
+                message: format!("{} · [{} → 期望 {}]", m.name, m.wrong_cat, m.dest_cat),
                 status: "warn".to_string(),
                 path: Some(m.path.clone()),
                 price: None,
@@ -868,7 +954,7 @@ pub fn fix_mismatch(
     let cookie = resolve_cookie(None, &config);
     let client = make_session(&config, cookie.as_deref());
 
-    Ok(spawn_job(&registry, move |flag| {
+    Ok(spawn_job(&registry, on_event.clone(), move |flag| {
         let found = engine::audit::mismatch_audit(&base_path, |id| {
             if cancelled(&flag) {
                 return None;
@@ -915,8 +1001,8 @@ pub fn fix_mismatch(
             } else {
                 failed += 1;
                 let _ = on_event.send(ProgressEvent::ItemError {
-                    id: format!("{} · {}", m.id, m.name),
-                    message: outcome.message,
+                    id: m.id.clone(),
+                    message: format!("{} · {}", m.name, outcome.message),
                 });
             }
         }
@@ -1093,4 +1179,76 @@ pub fn set_app_icon(app: AppHandle, id: String) -> Result<(), String> {
         w.set_icon(icon).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_directories;
+    use std::path::Path;
+
+    #[test]
+    fn file_passthrough_keeps_order() {
+        let files = vec!["a.zip".to_string(), "b.zip".to_string()];
+        assert_eq!(expand_directories(&files), files);
+    }
+
+    #[test]
+    fn directory_expands_recursively_and_skips_system_files() {
+        let tmp = std::env::temp_dir().join(format!("bvt-expand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("x.zip"), b"x").unwrap();
+        std::fs::write(tmp.join("desktop.ini"), b"d").unwrap();
+        std::fs::write(tmp.join("Thumbs.db"), b"t").unwrap();
+        std::fs::write(tmp.join("sub").join("y.package"), b"y").unwrap();
+
+        let out = expand_directories(&[tmp.to_string_lossy().into_owned()]);
+        let mut rel: Vec<std::path::PathBuf> = out
+            .iter()
+            .map(|s| {
+                let p = Path::new(s);
+                p.strip_prefix(&tmp)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default()
+            })
+            .collect();
+        rel.sort();
+        let rel: Vec<String> = rel
+            .iter()
+            .map(|p| {
+                p.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .collect();
+        assert_eq!(rel, vec!["sub/y.package".to_string(), "x.zip".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_skips_symlinks() {
+        let tmp = std::env::temp_dir().join(format!(
+            "bvt-expand-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("real.zip"), b"r").unwrap();
+        std::os::unix::fs::symlink(&tmp, tmp.join("loop")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("real.zip"), tmp.join("alias.zip")).unwrap();
+        let out = expand_directories(&[tmp.to_string_lossy().into_owned()]);
+        let names: Vec<_> = out
+            .iter()
+            .filter_map(|s| Path::new(s).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["real.zip".to_string()]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

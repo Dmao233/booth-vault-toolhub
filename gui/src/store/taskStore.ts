@@ -70,7 +70,6 @@ type TaskState = {
   latestByKind: Partial<Record<TaskKind, string>>;
   begin: (taskId: string, init: Pick<TaskRecord, 'kind' | 'label' | 'cmd' | 'args'>) => void;
   applyEvent: (taskId: string, evt: ProgressEvt) => void;
-  markError: (taskId: string, message: string) => void;
 };
 
 export const useTaskStore = create<TaskState>((set) => ({
@@ -78,26 +77,29 @@ export const useTaskStore = create<TaskState>((set) => ({
   latestByKind: {},
 
   begin: (taskId, init) =>
-    set((s) => ({
-      tasks: {
-        ...s.tasks,
-        [taskId]: {
-          kind: init.kind,
-          label: init.label,
-          status: 'running',
-          total: 0,
-          done: 0,
-          failed: 0,
-          updateable: 0,
-          items: [],
-          logs: [],
-          startedAt: Date.now(),
-          cmd: init.cmd,
-          args: init.args,
+    set((s) => {
+      const latestByKind = { ...s.latestByKind, [init.kind]: taskId };
+      return {
+        tasks: {
+          ...pruneTasks(s.tasks, latestByKind, taskId),
+          [taskId]: {
+            kind: init.kind,
+            label: init.label,
+            status: 'running',
+            total: 0,
+            done: 0,
+            failed: 0,
+            updateable: 0,
+            items: [],
+            logs: [],
+            startedAt: Date.now(),
+            cmd: init.cmd,
+            args: stripCookie(init.args),
+          },
         },
-      },
-      latestByKind: { ...s.latestByKind, [init.kind]: taskId },
-    })),
+        latestByKind,
+      };
+    }),
 
   applyEvent: (taskId, evt) =>
     set((s) => {
@@ -113,7 +115,7 @@ export const useTaskStore = create<TaskState>((set) => ({
           next.total = evt.total ?? next.total;
           break;
         case 'itemDone':
-          next.items = [
+          next.items = capItems([
             ...next.items,
             {
               id: String(evt.id ?? ''),
@@ -122,10 +124,10 @@ export const useTaskStore = create<TaskState>((set) => ({
               path: evt.path,
               price: evt.price,
             },
-          ];
+          ]);
           break;
         case 'candidates':
-          next.items = [
+          next.items = capItems([
             ...next.items,
             {
               id: String(evt.picked ?? ''),
@@ -137,50 +139,42 @@ export const useTaskStore = create<TaskState>((set) => ({
               picked: evt.picked ?? undefined,
               ambiguous: evt.ambiguous,
             },
-          ];
+          ]);
           break;
         case 'itemError':
-          next.items = [
+          next.items = capItems([
             ...next.items,
             {
               id: String(evt.id ?? ''),
               message: String(evt.message ?? ''),
               status: 'err',
             },
-          ];
+          ]);
           break;
-        case 'finished':
+        case 'finished': {
+          const abort = next.items.some(isAbortItem);
+          const errCount = next.items.filter((i) => i.status === 'err').length;
           next.status = 'done';
-          next.done = evt.done ?? next.done;
-          next.failed = evt.failed ?? next.items.filter((i) => i.status === 'err').length;
+          if (abort) {
+            next.done = Math.max(next.done, evt.done ?? 0);
+            next.failed = Math.max(next.failed, evt.failed ?? 0, errCount);
+          } else {
+            next.done = evt.done ?? next.done;
+            next.failed = evt.failed ?? errCount;
+          }
           next.updateable = evt.updateable ?? next.updateable;
           break;
+        }
         case 'cancelled':
           next.status = 'cancelled';
           break;
         case 'log':
-          next.logs = [...next.logs, String(evt.line ?? '')];
+          next.logs = capped([...next.logs, String(evt.line ?? '')], LOG_CAP);
           break;
         default:
           break;
       }
       return { tasks: { ...s.tasks, [taskId]: next } };
-    }),
-
-  markError: (taskId, message) =>
-    set((s) => {
-      const t = s.tasks[taskId];
-      if (!t) return s;
-      return {
-        tasks: {
-          ...s.tasks,
-          [taskId]: {
-            ...t,
-            status: 'error',
-            items: [...t.items, { id: '-', message, status: 'err' }],
-          },
-        },
-      };
     }),
 }));
 
@@ -191,10 +185,59 @@ export function useLatestTask(kind: TaskKind): { id: string; task: TaskRecord } 
   return { id, task };
 }
 
-export function runningCount(tasks: Record<string, TaskRecord>): number {
-  return Object.values(tasks).filter((t) => t.status === 'running').length;
+const ABORT_MSG = '任务异常终止';
+
+function isAbortItem(i: TaskItem): boolean {
+  return i.message === ABORT_MSG;
 }
 
 export function failedItems(task: TaskRecord): TaskItem[] {
-  return task.items.filter((i) => i.status === 'err');
+  return task.items.filter((i) => i.status === 'err' && !isAbortItem(i));
+}
+
+function keepTask(
+  id: string,
+  t: TaskRecord,
+  latestByKind: Partial<Record<TaskKind, string>>,
+): boolean {
+  if (t.status === 'running') return true;
+  if (t.status === 'done' && t.failed > 0) return true;
+  return latestByKind[t.kind] === id;
+}
+
+function pruneTasks(
+  tasks: Record<string, TaskRecord>,
+  latestByKind: Partial<Record<TaskKind, string>>,
+  keepId: string,
+): Record<string, TaskRecord> {
+  const next: Record<string, TaskRecord> = {};
+  for (const [id, t] of Object.entries(tasks)) {
+    if (id === keepId || keepTask(id, t, latestByKind)) next[id] = t;
+  }
+  return next;
+}
+
+const ITEM_CAP = 500;
+const LOG_CAP = 200;
+
+function capped<T>(xs: T[], cap: number): T[] {
+  return xs.length > cap ? xs.slice(-cap) : xs;
+}
+
+function capItems(xs: TaskItem[]): TaskItem[] {
+  if (xs.length <= ITEM_CAP) return xs;
+  const errs = xs.filter((i) => i.status === 'err');
+  const keepErr = errs.length > ITEM_CAP ? errs.slice(-ITEM_CAP) : errs;
+  const keepErrSet = new Set(keepErr);
+  const room = ITEM_CAP - keepErr.length;
+  const others = room > 0 ? xs.filter((i) => !keepErrSet.has(i)).slice(-room) : [];
+  const keep = new Set([...keepErr, ...others]);
+  return xs.filter((i) => keep.has(i));
+}
+
+function stripCookie(args: Record<string, unknown>): Record<string, unknown> {
+  if (!('cookie' in args)) return args;
+  const next = { ...args };
+  delete next.cookie;
+  return next;
 }

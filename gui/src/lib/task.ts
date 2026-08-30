@@ -7,8 +7,10 @@ import {
   useTaskStore,
   type ProgressEvt,
   type TaskKind,
+  type TaskRecord,
   failedItems,
 } from '../store/taskStore';
+import { useAppConfigStore } from '../store/appConfigStore';
 
 export type { ProgressEvt, TaskKind };
 
@@ -52,6 +54,20 @@ export async function cancelTask(taskId: string): Promise<void> {
   await invoke('cancel_task', { taskId });
 }
 
+function asStringList(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(String) : [];
+}
+
+function forceIdForRetry(file: string, task: TaskRecord): string {
+  const origFiles = asStringList(task.args.files);
+  const origForce = asStringList(task.args.forceIds);
+  const idx = origFiles.indexOf(file);
+  if (idx >= 0 && origForce[idx]) return origForce[idx];
+  const previewId = useTaskStore.getState().latestByKind.search;
+  const preview = previewId ? useTaskStore.getState().tasks[previewId] : undefined;
+  return preview?.items.find((i) => i.source === file && i.picked)?.picked ?? '';
+}
+
 export async function retryFailed(taskId: string): Promise<string | null> {
   const task = useTaskStore.getState().tasks[taskId];
   if (!task) return null;
@@ -60,14 +76,22 @@ export async function retryFailed(taskId: string): Promise<string | null> {
   const ids = failed.map((i) => i.path || i.source || i.id).filter(Boolean);
   if (ids.length === 0) return null;
   const args = { ...task.args };
+  args.cookie = useAppConfigStore.getState().cookie || null;
   if (task.kind === 'download' || task.cmd === 'download') {
-    args.items = failed.map((i) => i.id);
-    args.shop = null;
+    const shopErrs = failed.filter((i) => i.message.startsWith('店铺翻页失败'));
+    const itemErrs = failed.filter((i) => !i.message.startsWith('店铺翻页失败'));
+    const prevShop = typeof task.args.shop === 'string' ? task.args.shop : '';
+    const retryItems = itemErrs.map((i) => i.id).filter(Boolean);
+    const retryShop = shopErrs.length ? prevShop || shopErrs[0].id : null;
+    if (retryItems.length === 0 && !retryShop) return null;
+    args.items = retryItems;
+    args.shop = retryShop;
   } else if (task.kind === 'organize' || task.cmd === 'organize') {
     args.archives = ids;
   } else if (task.cmd === 'search') {
     args.files = ids;
     args.dryRun = false;
+    args.forceIds = ids.map((file) => forceIdForRetry(file, task));
   } else {
     return null;
   }

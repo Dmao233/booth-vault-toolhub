@@ -87,6 +87,13 @@ const PageWrap = styled.div`
   }
 `;
 
+function isEditableTarget(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.isContentEditable) return true;
+  const tag = el.tagName;
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT';
+}
+
 function App() {
   const {
     theme, mode, systemTheme, animSpeed, motifOpacity, appIcon, setSystemTheme, hydrate: hydrateTheme,
@@ -115,6 +122,9 @@ function App() {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.target instanceof Element && e.target.closest('[role=dialog]')) return;
+      if (isEditableTarget(e.target)) return;
       if ((e.metaKey || e.ctrlKey) && e.key >= '1' && e.key <= '6') {
         const item = NAV_ITEMS[Number(e.key) - 1];
         if (!item) return;
@@ -158,12 +168,6 @@ function App() {
     root.dataset.mode = resolved;
     const platform = detectPlatform();
     root.dataset.platform = platform;
-    if (platform === 'mac') {
-      // 玻璃填色交给 CSS，别让 JS 色板把原生材质盖死。
-      root.style.removeProperty('--bvt-glass');
-      root.style.removeProperty('--bvt-glass-2');
-      root.style.removeProperty('--bvt-glass-input');
-    }
   }, [theme, resolved, animSpeed, motifOpacity]);
 
   useEffect(() => {
